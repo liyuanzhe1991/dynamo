@@ -13,9 +13,11 @@ spinning up vLLM engine internals.
 from __future__ import annotations
 
 import json
+import random
 import threading
 import uuid
 from collections import deque
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -3396,8 +3398,10 @@ def test_zero_request_decode_injection_is_skipped_immediately():
 
     assert output is None
     assert stub._bench_current_point is None
+    # The fake-injection path stamps the KV seed regime before skipping.
+    expected_point = replace(point, sample_reasons=["kvwarm_fake_fallback"])
     assert stub._bench_skipped_points == [
-        SkippedBenchmarkPoint(point=point, reason="decode_injection_failed")
+        SkippedBenchmarkPoint(point=expected_point, reason="decode_injection_failed")
     ]
     # The admission step is injected one token short of the coordinate.
     stub._bench_inject_fake_decode.assert_called_once_with([15, 15, 15])
@@ -3855,3 +3859,229 @@ def test_skip_point_exempts_warmup_replicas_on_every_path():
     assert stub._bench_skipped_points == [
         SkippedBenchmarkPoint(point=real, reason="prefill_injection_failed")
     ]
+# ---------------------------------------------------------------------------
+# Synthetic-prompt randomization (salt-paired random token ids)
+# ---------------------------------------------------------------------------
+
+
+def _vocab_stub(vocab_size: int, dp_rank: int = 0):
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._bench_vocab_size = vocab_size
+    stub._fpm_dp_rank = dp_rank
+    return stub
+
+
+def test_synthetic_token_ids_are_salt_deterministic_and_in_vocab():
+    stub = _vocab_stub(151_000)
+
+    first = InstrumentedScheduler._bench_synthetic_token_ids(stub, "salt-a", 64)
+    second = InstrumentedScheduler._bench_synthetic_token_ids(stub, "salt-a", 64)
+    other = InstrumentedScheduler._bench_synthetic_token_ids(stub, "salt-b", 64)
+
+    assert first == second, "same salt must reproduce the same sequence"
+    assert first != other
+    assert all(1 <= token < 151_000 for token in first)
+    assert len(set(first)) > 1, "prompts must not be constant"
+
+
+def test_synthetic_token_ids_prefix_stability_pairs_seed_with_request():
+    """The fake prefix-cache pairing invariant: the seed request draws
+    ``prefix_tokens`` ids and the measuring request draws its full prompt
+    from the SAME salt, so the seed must be a strict prefix of the prompt --
+    otherwise the block hashes cannot match and every kv>0 point dies with
+    ``fake_prefix_cache_validation_failed``."""
+    stub = _vocab_stub(151_000)
+
+    seed = InstrumentedScheduler._bench_synthetic_token_ids(stub, "pair-salt", 48)
+    prompt = InstrumentedScheduler._bench_synthetic_token_ids(stub, "pair-salt", 320)
+
+    assert prompt[:48] == seed
+
+
+def test_synthetic_token_ids_decorrelate_across_dp_ranks():
+    """Lockstep keeps salts identical on every attention-DP rank; the rank
+    must be mixed into the seed so DEP expert routing is not fed the same
+    token stream N times over."""
+    rank0 = _vocab_stub(151_000, dp_rank=0)
+    rank1 = _vocab_stub(151_000, dp_rank=1)
+
+    tokens0 = InstrumentedScheduler._bench_synthetic_token_ids(rank0, "same", 64)
+    tokens1 = InstrumentedScheduler._bench_synthetic_token_ids(rank1, "same", 64)
+
+    assert tokens0 != tokens1
+
+
+def test_synthetic_token_ids_fall_back_to_zeros_without_vocab():
+    for vocab_size in (0, 1):
+        stub = _vocab_stub(vocab_size)
+        tokens = InstrumentedScheduler._bench_synthetic_token_ids(stub, "s", 8)
+        assert tokens == [0] * 8
+    # Stubs without the attribute (legacy construction paths) also fall back.
+    bare = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    assert InstrumentedScheduler._bench_synthetic_token_ids(bare, "s", 4) == [0] * 4
+
+
+def test_seed_and_measuring_request_share_block_hashes():
+    """End-to-end pairing through vLLM's real block hasher: the seeded
+    prefix request and the (longer) measuring request must produce identical
+    hashes for every full prefix block, with the same cache salt."""
+    block_size = 16
+    caching_hash_fn = instrumented_scheduler_module.get_hash_fn_by_name("sha256")
+    instrumented_scheduler_module.init_none_hash(caching_hash_fn)
+    hasher = instrumented_scheduler_module.get_request_block_hasher(
+        block_size, caching_hash_fn
+    )
+    stub = _vocab_stub(151_000)
+    salt = "block-hash-salt"
+    prefix_tokens = 64  # 4 full blocks
+    prompt_len = 128
+
+    seed_req = instrumented_scheduler_module.Request(
+        request_id="__bench_fake_prefix_0",
+        prompt_token_ids=InstrumentedScheduler._bench_synthetic_token_ids(
+            stub, salt, prefix_tokens
+        ),
+        sampling_params=instrumented_scheduler_module.SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt=salt,
+    )
+    measuring_req = instrumented_scheduler_module.Request(
+        request_id="__bench_0",
+        prompt_token_ids=InstrumentedScheduler._bench_synthetic_token_ids(
+            stub, salt, prompt_len
+        ),
+        sampling_params=instrumented_scheduler_module.SamplingParams(max_tokens=1),
+        pooling_params=None,
+        block_hasher=hasher,
+        cache_salt=salt,
+    )
+
+    seed_hashes = list(seed_req.block_hashes)
+    measuring_hashes = list(measuring_req.block_hashes)
+    assert len(seed_hashes) == prefix_tokens // block_size
+    assert measuring_hashes[: len(seed_hashes)] == seed_hashes
+
+
+def test_kvwarm_point_need_adds_repeats_only_for_giant_points():
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    small = SimpleNamespace(total_kv_read_tokens=999_999)
+    giant = SimpleNamespace(total_kv_read_tokens=1_000_000)
+    # Non-giant: admission writes ctx-1, steady writes ctx -> need 2.
+    assert InstrumentedScheduler._kvwarm_point_need(stub, small) == 2
+    # Giant (>= threshold): median-of-repeats adds repeats-1 (default 3).
+    assert InstrumentedScheduler._kvwarm_point_need(stub, giant) == 4
+
+
+def test_kvwarm_covers_requires_ready_chains_deep_enough():
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._kvwarm_plan = {2: 100}
+    stub._kvwarm_building = False
+    stub._kvwarm_stage_batch = 2
+    stub._kvwarm_chain_ids = ["c0", "c1"]
+    stub._kvwarm_chain_prompts = {"c0": [1] * 50, "c1": [1] * 50}
+    point = SimpleNamespace(batch_size=2, total_kv_read_tokens=10_000)
+    # injected + need(2) must fit inside every chain's prompt depth.
+    assert InstrumentedScheduler._kvwarm_covers(stub, point, [48, 48])
+    assert not InstrumentedScheduler._kvwarm_covers(stub, point, [49, 48])
+    # A fleet still under construction never covers.
+    stub._kvwarm_building = True
+    assert not InstrumentedScheduler._kvwarm_covers(stub, point, [10, 10])
+    stub._kvwarm_building = False
+    # Fewer live chains than the point's batch never covers.
+    wide = SimpleNamespace(batch_size=3, total_kv_read_tokens=10_000)
+    assert not InstrumentedScheduler._kvwarm_covers(stub, wide, [10, 10, 10])
+
+
+def _kvwarm_text_stub():
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._bench_grid_digest = "grid-digest"
+    stub._fpm_dp_rank = 0
+    stub._kvwarm_load_texts = lambda: ["alpha", "bravo", "charlie", "delta"]
+    stub._kvwarm_tokenizer = lambda: SimpleNamespace(
+        encode=lambda text, add_special_tokens=False: [ord(c) for c in text]
+    )
+    return stub
+
+
+def test_kvwarm_chain_tokens_are_deterministic_and_extend_monotonically():
+    first = InstrumentedScheduler._kvwarm_chain_token_ids(_kvwarm_text_stub(), 1, 6)
+    again = InstrumentedScheduler._kvwarm_chain_token_ids(_kvwarm_text_stub(), 1, 6)
+    assert first == again and len(first) >= 6
+    # Deepening the same chain only extends: the shallow draw stays a strict
+    # prefix (prefix-cache generational extension depends on this).
+    stub = _kvwarm_text_stub()
+    shallow = InstrumentedScheduler._kvwarm_chain_token_ids(stub, 2, 4)
+    deep = InstrumentedScheduler._kvwarm_chain_token_ids(stub, 2, 12)
+    assert deep[: len(shallow)] == shallow
+    # Distinct chains draw distinct conversation orders.
+    other = InstrumentedScheduler._kvwarm_chain_token_ids(_kvwarm_text_stub(), 3, 6)
+    assert other != first
+
+
+def test_synthetic_content_unset_env_keeps_random_path_byte_identical(monkeypatch):
+    monkeypatch.delenv("DYN_BENCH_PREFILL_CONTENT", raising=False)
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._bench_vocab_size = 1_000
+    stub._fpm_dp_rank = 0
+    got = InstrumentedScheduler._bench_synthetic_token_ids(stub, "salt", 32)
+    expected = random.Random("dp0:salt").choices(range(1, 1_000), k=32)
+    assert got == expected
+
+
+def test_synthetic_content_pool_windows_share_prefix_across_lengths(monkeypatch):
+    monkeypatch.setenv("DYN_BENCH_PREFILL_CONTENT", "sharegpt")
+    monkeypatch.delenv("DYN_BENCH_POOL_TAG", raising=False)
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._bench_vocab_size = 1_000
+    stub._fpm_dp_rank = 0
+    stub._bench_prefill_pool = list(range(1, 1_001))
+    short = InstrumentedScheduler._bench_synthetic_token_ids(stub, "s", 48)
+    long = InstrumentedScheduler._bench_synthetic_token_ids(stub, "s", 320)
+    # Window start depends only on the seed: any two lengths are strict
+    # prefixes -- the invariant the fake prefix-cache pairing relies on.
+    assert long[:48] == short
+    # Wrap-around past the pool end preserves both length and the invariant.
+    wrapped = InstrumentedScheduler._bench_synthetic_token_ids(stub, "s", 1_500)
+    assert len(wrapped) == 1_500 and wrapped[:320] == long
+
+
+def test_synthetic_content_chain_mode_routes_through_kvwarm_chains(monkeypatch):
+    monkeypatch.setenv("DYN_BENCH_PREFILL_CONTENT", "sharegpt_chain")
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._bench_vocab_size = 1_000
+    stub._fpm_dp_rank = 0
+    seen = []
+    stub._kvwarm_chain_token_ids = lambda idx, depth: seen.append((idx, depth)) or [7] * depth
+    out = InstrumentedScheduler._bench_synthetic_token_ids(stub, "salt", 9)
+    assert out == [7] * 9
+    (idx, depth), = seen
+    # Derived chain indices stay clear of the grid's own chain range and are
+    # deterministic per seed.
+    assert depth == 9 and 20_000_000 <= idx < 21_000_000
+    InstrumentedScheduler._bench_synthetic_token_ids(stub, "salt", 9)
+    assert seen[1] == (idx, 9)
+
+
+def test_content_pool_is_built_once_and_guards_small_datasets(monkeypatch):
+    monkeypatch.setenv("DYN_BENCH_PREFILL_CONTENT", "sharegpt")
+    stub = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    stub._bench_vocab_size = 1_000
+    stub._fpm_dp_rank = 0
+    calls = []
+    stub._kvwarm_load_texts = lambda: calls.append(1) or ["x" * 5_000]
+    stub._kvwarm_tokenizer = lambda: SimpleNamespace(
+        encode=lambda text, add_special_tokens=False: [1] * len(text)
+    )
+    InstrumentedScheduler._bench_synthetic_token_ids(stub, "a", 16)
+    InstrumentedScheduler._bench_synthetic_token_ids(stub, "b", 16)
+    assert calls == [1]  # pool built once, then cached
+    tiny = InstrumentedScheduler.__new__(InstrumentedScheduler)
+    tiny._bench_vocab_size = 1_000
+    tiny._fpm_dp_rank = 0
+    tiny._kvwarm_load_texts = lambda: ["too small"]
+    tiny._kvwarm_tokenizer = lambda: SimpleNamespace(
+        encode=lambda text, add_special_tokens=False: [1] * len(text)
+    )
+    with pytest.raises(RuntimeError, match="pool too small"):
+        InstrumentedScheduler._bench_synthetic_token_ids(tiny, "a", 16)
